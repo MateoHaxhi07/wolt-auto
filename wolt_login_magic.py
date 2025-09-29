@@ -106,10 +106,8 @@ CATEGORIES_TAB_SELECTORS = [
 ]
 # Primary handle selector (original)
 HANDLE_PRIMARY = (By.CSS_SELECTOR, "div[aria-roledescription='draggable']")
-# Fallback handle: role=button + svg (often used for drag celery)
+# Fallback handle: role=button + svg (often used for drag)
 HANDLE_FALLBACK = (By.XPATH, "//div[@role='button' and @tabindex='0' and @aria-disabled='false' and .//svg]")
-# Last resort: find rows by name then handle cell as first column
-ROW_NAME_CELL_XP = ".//div[normalize-space()=$NAME]"
 
 # ==============================
 # Utilities
@@ -136,6 +134,30 @@ def save_debug(driver, name):
         print(f"[debug] saved screenshot: {path}")
     except Exception as e:
         print("[debug] screenshot failed:", e)
+
+def dump_page_debug(driver, tag):
+    """Save page HTML + a quick text dump to wolt_debug for headless diagnosis."""
+    try:
+        os.makedirs("wolt_debug", exist_ok=True)
+        html_path = os.path.join("wolt_debug", f"{int(time.time())}_{tag}.html")
+        txt_path  = os.path.join("wolt_debug", f"{int(time.time())}_{tag}.txt")
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(driver.page_source)
+        # collect visible-ish texts
+        nodes = driver.find_elements(By.XPATH, "//*[normalize-space(text())!='']")
+        lines = []
+        for n in nodes[:1000]:
+            try:
+                t = n.text.strip()
+                if t:
+                    lines.append(t)
+            except Exception:
+                pass
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        print(f"[debug] dumped html -> {html_path} and text -> {txt_path}")
+    except Exception as e:
+        print("[debug] dump_page_debug failed:", e)
 
 # ==============================
 # Driver
@@ -398,40 +420,108 @@ def _row_name_text(row):
             return t
     return ""
 
+def try_enable_reorder_mode(driver):
+    """
+    Many dashboards hide drag handles until a 'Reorder' or 'Edit' button is toggled.
+    Click anything that looks like Reorder/Edit/Manage on the categories toolbar or per-row.
+    """
+    labels = [
+        "Reorder", "Re-order", "Arrange", "Manage order",
+        "Edit order", "Edit categories", "Edit",
+        "Organize", "Sort", "Customize"
+    ]
+    for label in labels:
+        try:
+            btns = driver.find_elements(By.XPATH, f"//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), '{label.lower()}')]")
+            if not btns:
+                btns = driver.find_elements(By.XPATH, f"//a[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), '{label.lower()}')]")
+            if btns:
+                try:
+                    human_click(driver, btns[0])
+                    time.sleep(0.5)
+                    print(f"[reorder] clicked button: {label}")
+                    return True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    try:
+        icon_buttons = driver.find_elements(By.XPATH, "//button[@aria-label='Edit' or @aria-haspopup='menu' or .//svg]")
+        if icon_buttons:
+            human_click(driver, icon_buttons[0])
+            time.sleep(0.4)
+            for label in labels:
+                try:
+                    item = driver.find_element(By.XPATH, f"//*[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), '{label.lower()}')]")
+                    human_click(driver, item)
+                    time.sleep(0.6)
+                    print(f"[reorder] selected menu item: {label}")
+                    return True
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    return False
+
 def _find_handles_anyway(driver):
-    """Try multiple strategies to locate draggable handles."""
-    # Strategy 1: primary selector
-    handles = driver.find_elements(*HANDLE_PRIMARY)
+    """
+    Try multiple strategies to locate draggable handles or draggable rows:
+    1) aria-roledescription='draggable'
+    2) draggable='true'
+    3) role='button' + svg (typical 6-dots)
+    4) test-id / data-testid patterns
+    5) derive from row by name cell if needed
+    """
+    handles = driver.find_elements(By.CSS_SELECTOR, "div[aria-roledescription='draggable']")
     if handles:
         return handles
 
-    # Strategy 2: role=button + svg
-    handles = driver.find_elements(*HANDLE_FALLBACK)
+    handles = driver.find_elements(By.CSS_SELECTOR, "[draggable='true']")
     if handles:
         return handles
 
-    # Strategy 3: derive handle from known row structure by name cells
-    # Find any known name on the page (from our desired order or a subset)
-    probe_names = DESIRED_ORDER[:6]  # limit probing
+    handles = driver.find_elements(By.XPATH, "//div[@role='button' and @tabindex='0' and @aria-disabled='false' and .//svg]")
+    if handles:
+        return handles
+
+    css_candidates = [
+        "[data-test-id*='drag']", "[data-testid*='drag']",
+        "[data-test-id*='handle']", "[data-testid*='handle']",
+        "button[aria-roledescription='draggable']",
+        "div[aria-grabbed='true']",
+    ]
+    for sel in css_candidates:
+        try:
+            handles = driver.find_elements(By.CSS_SELECTOR, sel)
+            if handles:
+                return handles
+        except Exception:
+            pass
+
+    probe_names = DESIRED_ORDER[:8]
     found = []
     for name in probe_names:
         try:
-            # Find an element whose normalized text equals the name
-            node = driver.find_element(By.XPATH, f"//*[normalize-space()='{name}']")
-            # climb to row container
-            row = node.find_element(By.XPATH, "ancestor::div[contains(@class,'sc-dPV')][1]")
-            # handle is usually the first column div with role=button or matching fallback
+            elem = driver.find_element(By.XPATH, f"//*[normalize-space()='{name}']")
+            row = elem.find_element(By.XPATH, "ancestor::div[contains(@class,'sc-dPV')][1]")
             try:
                 h = row.find_element(By.CSS_SELECTOR, "div[aria-roledescription='draggable']")
                 found.append(h)
-            except NoSuchElementException:
+            except Exception:
                 try:
-                    h = row.find_element(By.XPATH, ".//div[@role='button' and @tabindex='0' and .//svg]")
+                    h = row.find_element(By.CSS_SELECTOR, "[draggable='true']")
                     found.append(h)
-                except NoSuchElementException:
-                    pass
+                except Exception:
+                    try:
+                        h = row.find_element(By.XPATH, ".//div[@role='button' and @tabindex='0' and .//svg]")
+                        found.append(h)
+                    except Exception:
+                        pass
         except Exception:
             continue
+
     return found
 
 def _discover_handles_and_rows(driver):
@@ -452,16 +542,14 @@ def _discover_handles_and_rows(driver):
     return rows
 
 def _force_render_rows(driver):
-    # Scroll the main page to coerce virtualization
     for _ in range(8):
-        driver.execute_script("window.scrollBy(0, 600);")
+        driver.execute_script("window.scrollBy(0, 700);")
         time.sleep(0.12)
     for _ in range(8):
-        driver.execute_script("window.scrollBy(0, -600);")
+        driver.execute_script("window.scrollBy(0, -700);")
         time.sleep(0.12)
 
 def _maybe_click_categories_tab(driver):
-    # Some builds render a nav/tab for "Categories"
     for by, sel in CATEGORIES_TAB_SELECTORS:
         els = driver.find_elements(by, sel)
         if els:
@@ -472,44 +560,43 @@ def _maybe_click_categories_tab(driver):
             except Exception:
                 pass
 
-def ensure_categories_ready(driver, timeout=35) -> bool:
-    """Ensure Categories page is visible and hydrated."""
+def ensure_categories_ready(driver, timeout=40) -> bool:
+    """Ensure Categories page is visible, reorder mode is enabled, and handles are present."""
     if "/listing-manager/categories" not in driver.current_url:
         driver.get(TARGET_LISTING_MANAGER)
 
     accept_cookies_if_present(driver)
     _maybe_click_categories_tab(driver)
 
-    # Wait briefly for any search input as a sign of hydration
-    t0 = time.time()
-    while time.time() - t0 < 6:
-        for by, sel in SEARCH_INPUTS:
-            if driver.find_elements(by, sel):
-                break
-        time.sleep(0.2)
-        break
+    # first render passes (toggle reorder + scroll)
+    for _ in range(2):
+        try_enable_reorder_mode(driver)
+        _force_render_rows(driver)
+        handles = _find_handles_anyway(driver)
+        if handles:
+            print(f"[ready] found {len(handles)} handles (pass).")
+            return True
 
-    # Try 1: scroll to force render
-    _force_render_rows(driver)
-    handles = _find_handles_anyway(driver)
-    if handles:
-        print(f"[ready] found {len(handles)} handles (pass1).")
-        return True
-
-    # Try 2: reload once
-    print("[ready] handles not found yet; reloading once...")
+    # reload once
+    print("[ready] handles not found; reloading + trying reorder again...")
     driver.get(TARGET_LISTING_MANAGER)
+    time.sleep(1.0)
     accept_cookies_if_present(driver)
     _maybe_click_categories_tab(driver)
-    time.sleep(1.0)
+    try_enable_reorder_mode(driver)
     _force_render_rows(driver)
     handles = _find_handles_anyway(driver)
     print(f"[ready] handles after reload: {len(handles)}")
-    return len(handles) > 0
+    if handles:
+        return True
+
+    dump_page_debug(driver, "not_ready")
+    return False
 
 def discover_rows(driver):
-    if not ensure_categories_ready(driver, timeout=35):
+    if not ensure_categories_ready(driver, timeout=40):
         save_debug(driver, "categories_not_ready")
+        dump_page_debug(driver, "categories_not_ready")
         raise TimeoutException("Categories page not ready (no drag handles detected).")
 
     rows = _discover_handles_and_rows(driver)
@@ -561,8 +648,8 @@ def _safe_drag_to_above(driver, src_handle, dst_row):
         except Exception:
             time.sleep(0.2)
 
-def _normalize_name_list(names):  # helper
-    return [ _normalize(n) for n in names ]
+def _normalize_name_list(names):
+    return [_normalize(n) for n in names]
 
 def _bump_up_one(driver, index_now):
     """Move row at index_now up one position (above index_now-1) with verification."""
@@ -575,8 +662,7 @@ def _bump_up_one(driver, index_now):
         rows = discover_rows(driver)
         names = [r["name"] for r in rows]
         norms = _normalize_name_list(names)
-        curr_idx = norms.index(_normalize(name))  # refresh current index
-
+        curr_idx = norms.index(_normalize(name))
         if curr_idx <= index_now - 1:
             print(f"   ✓ already at {curr_idx+1}")
             return
