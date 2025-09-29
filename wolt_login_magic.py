@@ -2,12 +2,12 @@
 """
 Wolt magic-link automation with session health-check + Categories reorder.
 
-CI-safe + robust page-ready checks:
+CI-safe + robust page-ready:
 - Headless on CI (Render) when CI=true
-- No persistent user-data-dir on CI (prevents "user data dir in use")
-- Reads GOOGLE_CREDENTIALS_JSON / GOOGLE_TOKEN_JSON from env and writes to files
-- Adjacent-swap reordering with verification & retries
-- Strong ensure_categories_ready(): waits for tab, search input, and forces rows to render
+- Skip persistent user-data-dir on CI
+- Env secrets -> files for Gmail
+- Adjacent-swap drag with retries
+- Strong ensure_categories_ready() and multi-strategy handle discovery
 """
 
 import os
@@ -24,7 +24,7 @@ from typing import Optional, List
 # ─────────────────────────────────────────────────────────────
 CI = os.environ.get("CI", "").lower() == "true"
 PROFILE_BASE = r"C:\tmp\wolt_profile" if os.name == "nt" else "/tmp/wolt_profile"
-PROFILE_DIR = PROFILE_BASE  # local only; we skip on CI
+PROFILE_DIR = PROFILE_BASE  # local only; CI skips
 
 # Selenium
 from selenium import webdriver
@@ -39,6 +39,7 @@ from selenium.common.exceptions import (
     TimeoutException,
     ElementClickInterceptedException,
     MoveTargetOutOfBoundsException,
+    NoSuchElementException,
 )
 from webdriver_manager.chrome import ChromeDriverManager
 
@@ -87,16 +88,28 @@ GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 SEARCH_WINDOW_MIN = 60
 
 # other tuning
-WAIT = 25
+WAIT = 30 if CI else 25
 COOLDOWN_MIN = 10
 STAMP_FILE = "wolt_last_request.json"
 URL_REGEX = r"https?://[^\s\"'>]+"
 MERCHANT_DOMAIN_HIT = "merchant.wolt.com"
 
-# Locators
-DRAG_HANDLE = (By.CSS_SELECTOR, "div[aria-roledescription='draggable']")
-SEARCH_INPUT = (By.CSS_SELECTOR, "input[placeholder='Search'], input[placeholder='Search…'], input[type='search']")
-CATEGORIES_TAB = (By.XPATH, "//button[.//text()[contains(.,'Categories')]] | //a[.//text()[contains(.,'Categories')]]")
+# Locators (broad)
+SEARCH_INPUTS = [
+    (By.CSS_SELECTOR, "input[placeholder*='Search']"),
+    (By.CSS_SELECTOR, "input[type='search']"),
+]
+CATEGORIES_TAB_SELECTORS = [
+    (By.XPATH, "//button[.//text()[contains(.,'Categories')]]"),
+    (By.XPATH, "//a[.//text()[contains(.,'Categories')]]"),
+    (By.XPATH, "//button[contains(.,'Categories')]"),
+]
+# Primary handle selector (original)
+HANDLE_PRIMARY = (By.CSS_SELECTOR, "div[aria-roledescription='draggable']")
+# Fallback handle: role=button + svg (often used for drag celery)
+HANDLE_FALLBACK = (By.XPATH, "//div[@role='button' and @tabindex='0' and @aria-disabled='false' and .//svg]")
+# Last resort: find rows by name then handle cell as first column
+ROW_NAME_CELL_XP = ".//div[normalize-space()=$NAME]"
 
 # ==============================
 # Utilities
@@ -132,13 +145,13 @@ def build_driver(headless: bool = False) -> webdriver.Chrome:
     if headless:
         opts.add_argument("--headless=new")
 
-    opts.add_argument("--window-size=1440,1000")
+    opts.add_argument("--window-size=1920,1200")
     opts.add_argument("--lang=en-US,en;q=0.9")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
 
-    # Use persistent profile only on local machine; on CI we skip to avoid locks
+    # Persistent profile only locally
     if not CI:
         os.makedirs(PROFILE_DIR, exist_ok=True)
         opts.add_argument(f"--user-data-dir={PROFILE_DIR}")
@@ -218,26 +231,16 @@ CONFIRM_BTN_TESTID = "magic-login-landing.confirm"
 CONFIRM_BTN_XPATH = "/html/body/div[2]/div[2]/main/div/button"
 
 def accept_cookies_if_present(driver):
-    try:
-        btn = WebDriverWait(driver, 4).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, COOKIE_ACCEPT_CSS))
-        )
-        human_click(driver, btn)
-        time.sleep(0.4)
-        return
-    except Exception:
-        pass
-    try:
-        btn = WebDriverWait(driver, 2).until(
-            EC.element_to_be_clickable((By.XPATH, COOKIE_ACCEPT_XPATH))
-        )
-        human_click(driver, btn)
-        time.sleep(0.3)
-    except Exception:
-        pass
+    for by, sel in [(By.CSS_SELECTOR, COOKIE_ACCEPT_CSS), (By.XPATH, COOKIE_ACCEPT_XPATH)]:
+        try:
+            btn = WebDriverWait(driver, 3).until(EC.element_to_be_clickable((by, sel)))
+            human_click(driver, btn)
+            time.sleep(0.3)
+            return
+        except Exception:
+            pass
 
 def set_zoom_and_layout(driver, zoom_pct=80, width=1920, height=1200):
-    """Zoom out and enlarge window so more rows are visible."""
     try:
         driver.set_window_size(width, height)
     except Exception:
@@ -395,14 +398,53 @@ def _row_name_text(row):
             return t
     return ""
 
+def _find_handles_anyway(driver):
+    """Try multiple strategies to locate draggable handles."""
+    # Strategy 1: primary selector
+    handles = driver.find_elements(*HANDLE_PRIMARY)
+    if handles:
+        return handles
+
+    # Strategy 2: role=button + svg
+    handles = driver.find_elements(*HANDLE_FALLBACK)
+    if handles:
+        return handles
+
+    # Strategy 3: derive handle from known row structure by name cells
+    # Find any known name on the page (from our desired order or a subset)
+    probe_names = DESIRED_ORDER[:6]  # limit probing
+    found = []
+    for name in probe_names:
+        try:
+            # Find an element whose normalized text equals the name
+            node = driver.find_element(By.XPATH, f"//*[normalize-space()='{name}']")
+            # climb to row container
+            row = node.find_element(By.XPATH, "ancestor::div[contains(@class,'sc-dPV')][1]")
+            # handle is usually the first column div with role=button or matching fallback
+            try:
+                h = row.find_element(By.CSS_SELECTOR, "div[aria-roledescription='draggable']")
+                found.append(h)
+            except NoSuchElementException:
+                try:
+                    h = row.find_element(By.XPATH, ".//div[@role='button' and @tabindex='0' and .//svg]")
+                    found.append(h)
+                except NoSuchElementException:
+                    pass
+        except Exception:
+            continue
+    return found
+
 def _discover_handles_and_rows(driver):
-    handles = driver.find_elements(*DRAG_HANDLE)
+    handles = _find_handles_anyway(driver)
     rows = []
     for h in handles:
         try:
             row = _row_container_from_handle(h)
         except Exception:
-            row = h.find_element(By.XPATH, "../../..")
+            try:
+                row = h.find_element(By.XPATH, "../../..")
+            except Exception:
+                continue
         name = _row_name_text(row)
         y = row.location.get("y", 0)
         rows.append({"name": name, "row": row, "handle": h, "y": y})
@@ -410,70 +452,71 @@ def _discover_handles_and_rows(driver):
     return rows
 
 def _force_render_rows(driver):
-    # Scroll the list container to force virtualization to render rows
-    try:
-        # try scrolling the main content area
-        for _ in range(6):
-            driver.execute_script("window.scrollBy(0, 600);")
-            time.sleep(0.15)
-        for _ in range(6):
-            driver.execute_script("window.scrollBy(0, -600);")
-            time.sleep(0.15)
-    except Exception:
-        pass
+    # Scroll the main page to coerce virtualization
+    for _ in range(8):
+        driver.execute_script("window.scrollBy(0, 600);")
+        time.sleep(0.12)
+    for _ in range(8):
+        driver.execute_script("window.scrollBy(0, -600);")
+        time.sleep(0.12)
 
-def ensure_categories_ready(driver, timeout=25) -> bool:
-    """Ensure we are on the Categories page and rows are rendered."""
-    # 1) Ensure correct URL
+def _maybe_click_categories_tab(driver):
+    # Some builds render a nav/tab for "Categories"
+    for by, sel in CATEGORIES_TAB_SELECTORS:
+        els = driver.find_elements(by, sel)
+        if els:
+            try:
+                human_click(driver, els[0])
+                time.sleep(0.4)
+                return
+            except Exception:
+                pass
+
+def ensure_categories_ready(driver, timeout=35) -> bool:
+    """Ensure Categories page is visible and hydrated."""
     if "/listing-manager/categories" not in driver.current_url:
         driver.get(TARGET_LISTING_MANAGER)
 
-    # 2) Accept cookies if any
     accept_cookies_if_present(driver)
+    _maybe_click_categories_tab(driver)
 
-    # 3) Wait for any of: search input or the Categories tab element
+    # Wait briefly for any search input as a sign of hydration
     t0 = time.time()
-    while time.time() - t0 < timeout:
-        if driver.current_url.endswith("/categories") or "/listing-manager/categories" in driver.current_url:
-            pass
-        # See if search input shows (often appears before rows)
-        inputs = driver.find_elements(*SEARCH_INPUT)
-        tabs = driver.find_elements(*CATEGORIES_TAB)
-        if inputs or tabs:
-            break
-        time.sleep(0.3)
+    while time.time() - t0 < 6:
+        for by, sel in SEARCH_INPUTS:
+            if driver.find_elements(by, sel):
+                break
+        time.sleep(0.2)
+        break
 
-    # 4) Try to render rows
+    # Try 1: scroll to force render
     _force_render_rows(driver)
-    handles = driver.find_elements(*DRAG_HANDLE)
+    handles = _find_handles_anyway(driver)
     if handles:
-        print(f"[ready] found {len(handles)} handles.")
+        print(f"[ready] found {len(handles)} handles (pass1).")
         return True
 
-    # 5) Retry once with reload
+    # Try 2: reload once
     print("[ready] handles not found yet; reloading once...")
     driver.get(TARGET_LISTING_MANAGER)
+    accept_cookies_if_present(driver)
+    _maybe_click_categories_tab(driver)
     time.sleep(1.0)
     _force_render_rows(driver)
-    handles = driver.find_elements(*DRAG_HANDLE)
+    handles = _find_handles_anyway(driver)
     print(f"[ready] handles after reload: {len(handles)}")
     return len(handles) > 0
 
 def discover_rows(driver):
-    # Use stronger readiness routine instead of a single wait
-    ready = ensure_categories_ready(driver, timeout=30)
-    if not ready:
+    if not ensure_categories_ready(driver, timeout=35):
         save_debug(driver, "categories_not_ready")
         raise TimeoutException("Categories page not ready (no drag handles detected).")
 
     rows = _discover_handles_and_rows(driver)
-
-    # if virtualized, nudge and refetch
     if len(rows) < 5:
         _force_render_rows(driver)
         rows = _discover_handles_and_rows(driver)
 
-    # log
     print(f"[rows] discovered: {len(rows)}")
     return rows
 
@@ -488,14 +531,17 @@ def _safe_drag_to_above(driver, src_handle, dst_row):
     try:
         dst_handle = dst_row.find_element(By.CSS_SELECTOR, "div[aria-roledescription='draggable']")
     except Exception:
-        dst_handle = dst_row
+        try:
+            dst_handle = dst_row.find_element(By.XPATH, ".//div[@role='button' and @tabindex='0' and .//svg]")
+        except Exception:
+            dst_handle = dst_row
 
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", dst_handle)
     time.sleep(0.2)
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", src_handle)
     time.sleep(0.2)
 
-    upward_offsets = [-14, -24, -38]
+    upward_offsets = [-14, -24, -38, -52]
     for off in upward_offsets:
         try:
             actions = ActionChains(driver)
@@ -507,27 +553,30 @@ def _safe_drag_to_above(driver, src_handle, dst_row):
             actions.move_by_offset(0, -4).pause(0.06)
             actions.move_by_offset(0, +4).pause(0.06)
             actions.release().perform()
-            time.sleep(0.55)
+            time.sleep(0.6)
             return
         except MoveTargetOutOfBoundsException:
-            driver.execute_script("window.scrollBy(0, -120);")
+            driver.execute_script("window.scrollBy(0, -140);")
             time.sleep(0.2)
         except Exception:
             time.sleep(0.2)
 
+def _normalize_name_list(names):  # helper
+    return [ _normalize(n) for n in names ]
+
 def _bump_up_one(driver, index_now):
     """Move row at index_now up one position (above index_now-1) with verification."""
     assert index_now > 0, "Cannot bump index 0 up"
-    def N(s): return _normalize(s)
-
     rows_before = discover_rows(driver)
     name = rows_before[index_now]["name"]
     print(f"   ↥ bump '{name}' {index_now+1}→{index_now}")
 
     for attempt in range(1, 4):
         rows = discover_rows(driver)
-        current_names = [r["name"] for r in rows]
-        curr_idx = [N(n) for n in current_names].index(N(name))
+        names = [r["name"] for r in rows]
+        norms = _normalize_name_list(names)
+        curr_idx = norms.index(_normalize(name))  # refresh current index
+
         if curr_idx <= index_now - 1:
             print(f"   ✓ already at {curr_idx+1}")
             return
@@ -538,23 +587,22 @@ def _bump_up_one(driver, index_now):
 
         rows_after = discover_rows(driver)
         names_after = [r["name"] for r in rows_after]
-        new_idx = [N(n) for n in names_after].index(N(name))
+        new_idx = _normalize_name_list(names_after).index(_normalize(name))
         if new_idx == curr_idx - 1:
             return
 
-        driver.execute_script("window.scrollBy(0, -120);")
-        time.sleep(0.2)
+        driver.execute_script("window.scrollBy(0, -140);")
+        time.sleep(0.25)
 
     print(f"   ⚠️ could not bump '{name}' this step; continuing")
 
 def move_name_to_position(driver, name, target_index):
-    def N(s): return _normalize(s)
     while True:
         rows = discover_rows(driver)
         names = [r["name"] for r in rows]
-        norms = [N(n) for n in names]
+        norms = _normalize_name_list(names)
         try:
-            idx_now = norms.index(N(name))
+            idx_now = norms.index(_normalize(name))
         except ValueError:
             print(f"⚠️  '{name}' not found; skipping.")
             return
@@ -585,14 +633,12 @@ def verify_order(driver, desired_names, normalize=True):
 
 def reorder_to(driver, desired_names):
     print("▶ Reordering to target list (adjacent swaps with verification) ...")
-    def N(s): return _normalize(s)
-
     for i, want in enumerate(desired_names):
         rows = discover_rows(driver)
         names = [r["name"] for r in rows]
-        norms = [N(n) for n in names]
+        norms = _normalize_name_list(names)
         try:
-            idx_now = norms.index(N(want))
+            idx_now = norms.index(_normalize(want))
         except ValueError:
             print(f"⚠️  '{want}' not found; skipping.")
             continue
@@ -605,8 +651,8 @@ def reorder_to(driver, desired_names):
             _bump_up_one(driver, idx_now)
             rows = discover_rows(driver)
             names = [r["name"] for r in rows]
-            norms = [N(n) for n in names]
-            idx_now = norms.index(N(want))
+            norms = _normalize_name_list(names)
+            idx_now = norms.index(_normalize(want))
 
     ok, missing, diffs = verify_order(driver, desired_names)
     if ok:
@@ -618,7 +664,7 @@ def reorder_to(driver, desired_names):
 def move_name_to_top(driver, name_to_top: str):
     rows = discover_rows(driver)
     names = [r["name"] for r in rows]
-    norms = [_normalize(n) for n in names]
+    norms = _normalize_name_list(names)
     try:
         idx = norms.index(_normalize(name_to_top))
     except ValueError:
