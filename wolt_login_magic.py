@@ -3,7 +3,8 @@
 Wolt magic-link automation with session health-check + Categories reorder.
 
 CI-safe + robust page-ready:
-- Headless on CI (Render) when CI=true
+- On CI (Render), start a virtual display (Xvfb) and run Chrome *non-headless*
+  to ensure the UI fully hydrates (fixes missing drag handles).
 - Skip persistent user-data-dir on CI
 - Env secrets -> files for Gmail
 - Adjacent-swap drag with retries
@@ -25,6 +26,18 @@ from typing import Optional, List
 CI = os.environ.get("CI", "").lower() == "true"
 PROFILE_BASE = r"C:\tmp\wolt_profile" if os.name == "nt" else "/tmp/wolt_profile"
 PROFILE_DIR = PROFILE_BASE  # local only; CI skips
+
+# Virtual display (Xvfb) for CI
+display = None
+if CI:
+    try:
+        from pyvirtualdisplay import Display
+        # large screen to see more rows
+        display = Display(visible=False, size=(1920, 1200), color_depth=24)
+        display.start()
+        print("[display] Xvfb started.")
+    except Exception as e:
+        print("[display] Xvfb failed to start:", e)
 
 # Selenium
 from selenium import webdriver
@@ -88,7 +101,7 @@ GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 SEARCH_WINDOW_MIN = 60
 
 # other tuning
-WAIT = 30 if CI else 25
+WAIT = 35 if CI else 25
 COOLDOWN_MIN = 10
 STAMP_FILE = "wolt_last_request.json"
 URL_REGEX = r"https?://[^\s\"'>]+"
@@ -104,9 +117,7 @@ CATEGORIES_TAB_SELECTORS = [
     (By.XPATH, "//a[.//text()[contains(.,'Categories')]]"),
     (By.XPATH, "//button[contains(.,'Categories')]"),
 ]
-# Primary handle selector (original)
 HANDLE_PRIMARY = (By.CSS_SELECTOR, "div[aria-roledescription='draggable']")
-# Fallback handle: role=button + svg (often used for drag)
 HANDLE_FALLBACK = (By.XPATH, "//div[@role='button' and @tabindex='0' and @aria-disabled='false' and .//svg]")
 
 # ==============================
@@ -143,7 +154,6 @@ def dump_page_debug(driver, tag):
         txt_path  = os.path.join("wolt_debug", f"{int(time.time())}_{tag}.txt")
         with open(html_path, "w", encoding="utf-8") as f:
             f.write(driver.page_source)
-        # collect visible-ish texts
         nodes = driver.find_elements(By.XPATH, "//*[normalize-space(text())!='']")
         lines = []
         for n in nodes[:1000]:
@@ -162,9 +172,11 @@ def dump_page_debug(driver, tag):
 # ==============================
 # Driver
 # ==============================
-def build_driver(headless: bool = False) -> webdriver.Chrome:
+def build_driver(run_headless: bool = False) -> webdriver.Chrome:
     opts = Options()
-    if headless:
+
+    # On CI we want REAL rendering → non-headless inside Xvfb
+    if not CI and run_headless:
         opts.add_argument("--headless=new")
 
     opts.add_argument("--window-size=1920,1200")
@@ -421,10 +433,6 @@ def _row_name_text(row):
     return ""
 
 def try_enable_reorder_mode(driver):
-    """
-    Many dashboards hide drag handles until a 'Reorder' or 'Edit' button is toggled.
-    Click anything that looks like Reorder/Edit/Manage on the categories toolbar or per-row.
-    """
     labels = [
         "Reorder", "Re-order", "Arrange", "Manage order",
         "Edit order", "Edit categories", "Edit",
@@ -466,14 +474,6 @@ def try_enable_reorder_mode(driver):
     return False
 
 def _find_handles_anyway(driver):
-    """
-    Try multiple strategies to locate draggable handles or draggable rows:
-    1) aria-roledescription='draggable'
-    2) draggable='true'
-    3) role='button' + svg (typical 6-dots)
-    4) test-id / data-testid patterns
-    5) derive from row by name cell if needed
-    """
     handles = driver.find_elements(By.CSS_SELECTOR, "div[aria-roledescription='draggable']")
     if handles:
         return handles
@@ -560,7 +560,7 @@ def _maybe_click_categories_tab(driver):
             except Exception:
                 pass
 
-def ensure_categories_ready(driver, timeout=40) -> bool:
+def ensure_categories_ready(driver, timeout=45) -> bool:
     """Ensure Categories page is visible, reorder mode is enabled, and handles are present."""
     if "/listing-manager/categories" not in driver.current_url:
         driver.get(TARGET_LISTING_MANAGER)
@@ -594,7 +594,7 @@ def ensure_categories_ready(driver, timeout=40) -> bool:
     return False
 
 def discover_rows(driver):
-    if not ensure_categories_ready(driver, timeout=40):
+    if not ensure_categories_ready(driver, timeout=45):
         save_debug(driver, "categories_not_ready")
         dump_page_debug(driver, "categories_not_ready")
         raise TimeoutException("Categories page not ready (no drag handles detected).")
@@ -777,7 +777,8 @@ def main():
         with open("token.json", "w", encoding="utf-8") as f:
             f.write(os.environ["GOOGLE_TOKEN_JSON"])
 
-    driver = build_driver(headless=CI)
+    # On CI: run non-headless inside Xvfb → pass run_headless=False
+    driver = build_driver(run_headless=not CI)
     try:
         if is_logged_in(driver):
             print("✅ Session active — skipping magic-link flow.")
@@ -851,6 +852,12 @@ def main():
             driver.quit()
         except Exception:
             pass
+        if display:
+            try:
+                display.stop()
+                print("[display] Xvfb stopped.")
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     main()
