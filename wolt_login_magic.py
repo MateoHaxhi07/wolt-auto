@@ -2,11 +2,12 @@
 """
 Wolt magic-link automation with session health-check + Categories reorder.
 
-CI-safe version:
+CI-safe + robust page-ready checks:
 - Headless on CI (Render) when CI=true
 - No persistent user-data-dir on CI (prevents "user data dir in use")
 - Reads GOOGLE_CREDENTIALS_JSON / GOOGLE_TOKEN_JSON from env and writes to files
 - Adjacent-swap reordering with verification & retries
+- Strong ensure_categories_ready(): waits for tab, search input, and forces rows to render
 """
 
 import os
@@ -23,8 +24,7 @@ from typing import Optional, List
 # ─────────────────────────────────────────────────────────────
 CI = os.environ.get("CI", "").lower() == "true"
 PROFILE_BASE = r"C:\tmp\wolt_profile" if os.name == "nt" else "/tmp/wolt_profile"
-# Ephemeral profile dir if you ever want to pass one in CI; we won't pass any by default on CI.
-PROFILE_DIR = PROFILE_BASE
+PROFILE_DIR = PROFILE_BASE  # local only; we skip on CI
 
 # Selenium
 from selenium import webdriver
@@ -93,6 +93,11 @@ STAMP_FILE = "wolt_last_request.json"
 URL_REGEX = r"https?://[^\s\"'>]+"
 MERCHANT_DOMAIN_HIT = "merchant.wolt.com"
 
+# Locators
+DRAG_HANDLE = (By.CSS_SELECTOR, "div[aria-roledescription='draggable']")
+SEARCH_INPUT = (By.CSS_SELECTOR, "input[placeholder='Search'], input[placeholder='Search…'], input[type='search']")
+CATEGORIES_TAB = (By.XPATH, "//button[.//text()[contains(.,'Categories')]] | //a[.//text()[contains(.,'Categories')]]")
+
 # ==============================
 # Utilities
 # ==============================
@@ -112,6 +117,7 @@ def mark_requested():
 
 def save_debug(driver, name):
     try:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
         path = os.path.join(DEBUG_DIR, f"{int(time.time())}_{name}.png")
         driver.save_screenshot(path)
         print(f"[debug] saved screenshot: {path}")
@@ -126,7 +132,7 @@ def build_driver(headless: bool = False) -> webdriver.Chrome:
     if headless:
         opts.add_argument("--headless=new")
 
-    opts.add_argument("--window-size=1280,900")
+    opts.add_argument("--window-size=1440,1000")
     opts.add_argument("--lang=en-US,en;q=0.9")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--no-sandbox")
@@ -190,7 +196,7 @@ def human_type(el, text, jitter=(0.05, 0.18)):
 def human_click(driver, el):
     try:
         actions = ActionChains(driver)
-        actions.move_to_element(el).pause(random.uniform(0.15, 0.5)).click().perform()
+        actions.move_to_element(el).pause(random.uniform(0.15, 0.4)).click().perform()
     except Exception:
         try:
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
@@ -341,7 +347,6 @@ def find_latest_wolt_magic_link(svc, window_min: int) -> Optional[str]:
             print("[warn] failed to fetch message", m.get("id"), e)
             continue
 
-    # Extract links
         headers = {h["name"].lower(): h["value"] for h in full.get("payload", {}).get("headers", [])}
         print(f"[email] From: {headers.get('from')} | Subject: {headers.get('subject')}")
 
@@ -358,7 +363,7 @@ def find_latest_wolt_magic_link(svc, window_min: int) -> Optional[str]:
 def is_logged_in(driver: webdriver.Chrome) -> bool:
     try:
         driver.get("https://merchant.wolt.com/")
-        WebDriverWait(driver, 6).until(EC.url_contains(MERCHANT_DOMAIN_HIT))
+        WebDriverWait(driver, 8).until(EC.url_contains(MERCHANT_DOMAIN_HIT))
         try:
             WebDriverWait(driver, 4).until(EC.presence_of_element_located((By.CSS_SELECTOR, "header")))
         except Exception:
@@ -368,10 +373,8 @@ def is_logged_in(driver: webdriver.Chrome) -> bool:
         return False
 
 # ==============================
-# CATEGORIES
+# CATEGORIES + readiness
 # ==============================
-DRAG_HANDLE = (By.CSS_SELECTOR, "div[aria-roledescription='draggable']")
-
 def _normalize(s: str) -> str:
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
@@ -406,19 +409,72 @@ def _discover_handles_and_rows(driver):
     rows.sort(key=lambda r: r["y"])
     return rows
 
+def _force_render_rows(driver):
+    # Scroll the list container to force virtualization to render rows
+    try:
+        # try scrolling the main content area
+        for _ in range(6):
+            driver.execute_script("window.scrollBy(0, 600);")
+            time.sleep(0.15)
+        for _ in range(6):
+            driver.execute_script("window.scrollBy(0, -600);")
+            time.sleep(0.15)
+    except Exception:
+        pass
+
+def ensure_categories_ready(driver, timeout=25) -> bool:
+    """Ensure we are on the Categories page and rows are rendered."""
+    # 1) Ensure correct URL
+    if "/listing-manager/categories" not in driver.current_url:
+        driver.get(TARGET_LISTING_MANAGER)
+
+    # 2) Accept cookies if any
+    accept_cookies_if_present(driver)
+
+    # 3) Wait for any of: search input or the Categories tab element
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if driver.current_url.endswith("/categories") or "/listing-manager/categories" in driver.current_url:
+            pass
+        # See if search input shows (often appears before rows)
+        inputs = driver.find_elements(*SEARCH_INPUT)
+        tabs = driver.find_elements(*CATEGORIES_TAB)
+        if inputs or tabs:
+            break
+        time.sleep(0.3)
+
+    # 4) Try to render rows
+    _force_render_rows(driver)
+    handles = driver.find_elements(*DRAG_HANDLE)
+    if handles:
+        print(f"[ready] found {len(handles)} handles.")
+        return True
+
+    # 5) Retry once with reload
+    print("[ready] handles not found yet; reloading once...")
+    driver.get(TARGET_LISTING_MANAGER)
+    time.sleep(1.0)
+    _force_render_rows(driver)
+    handles = driver.find_elements(*DRAG_HANDLE)
+    print(f"[ready] handles after reload: {len(handles)}")
+    return len(handles) > 0
+
 def discover_rows(driver):
-    WebDriverWait(driver, 15).until(EC.presence_of_element_located(DRAG_HANDLE))
+    # Use stronger readiness routine instead of a single wait
+    ready = ensure_categories_ready(driver, timeout=30)
+    if not ready:
+        save_debug(driver, "categories_not_ready")
+        raise TimeoutException("Categories page not ready (no drag handles detected).")
+
     rows = _discover_handles_and_rows(driver)
 
-    # virtualized list: nudge
-    if len(rows) < 10:
-        driver.execute_script("window.scrollBy(0, 500);")
-        time.sleep(0.25)
-        driver.execute_script("window.scrollBy(0, 500);")
-        time.sleep(0.25)
-        driver.execute_script("window.scrollBy(0, -1000);")
-        time.sleep(0.25)
+    # if virtualized, nudge and refetch
+    if len(rows) < 5:
+        _force_render_rows(driver)
         rows = _discover_handles_and_rows(driver)
+
+    # log
+    print(f"[rows] discovered: {len(rows)}")
     return rows
 
 def print_order(rows):
@@ -428,14 +484,11 @@ def print_order(rows):
     print("--------------------------------\n")
 
 def _safe_drag_to_above(driver, src_handle, dst_row):
-    """
-    Drag the source HANDLE to just *above* the destination HANDLE.
-    Progressive offsets to ensure "insert above" is recognized.
-    """
+    """Drag source HANDLE to just above destination HANDLE with progressive offsets."""
     try:
         dst_handle = dst_row.find_element(By.CSS_SELECTOR, "div[aria-roledescription='draggable']")
     except Exception:
-        dst_handle = dst_row  # fallback
+        dst_handle = dst_row
 
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", dst_handle)
     time.sleep(0.2)
@@ -449,7 +502,7 @@ def _safe_drag_to_above(driver, src_handle, dst_row):
             actions.move_to_element(src_handle).pause(0.12)
             actions.click_and_hold(src_handle).pause(0.15)
             actions.move_to_element(dst_handle).pause(0.1)
-            actions.move_by_offset(-6, 0).pause(0.05)  # toward handle column
+            actions.move_by_offset(-6, 0).pause(0.05)
             actions.move_by_offset(0, off).pause(0.12)
             actions.move_by_offset(0, -4).pause(0.06)
             actions.move_by_offset(0, +4).pause(0.06)
@@ -465,7 +518,6 @@ def _safe_drag_to_above(driver, src_handle, dst_row):
 def _bump_up_one(driver, index_now):
     """Move row at index_now up one position (above index_now-1) with verification."""
     assert index_now > 0, "Cannot bump index 0 up"
-
     def N(s): return _normalize(s)
 
     rows_before = discover_rows(driver)
