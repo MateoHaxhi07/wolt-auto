@@ -2,11 +2,11 @@
 """
 Wolt magic-link automation with session health-check + Categories reorder.
 
-This version fixes MoveTargetOutOfBounds by:
-- Zooming out + larger window
-- Using adjacent-swap reordering (bubble up one slot at a time)
-- Dragging via element-to-element centers with a tiny offset fallback
-- Verifying & correcting at the end
+CI-safe version:
+- Headless on CI (Render) when CI=true
+- No persistent user-data-dir on CI (prevents "user data dir in use")
+- Reads GOOGLE_CREDENTIALS_JSON / GOOGLE_TOKEN_JSON from env and writes to files
+- Adjacent-swap reordering with verification & retries
 """
 
 import os
@@ -18,6 +18,14 @@ import random
 import unicodedata
 from typing import Optional, List
 
+# ─────────────────────────────────────────────────────────────
+# CI / Environment
+# ─────────────────────────────────────────────────────────────
+CI = os.environ.get("CI", "").lower() == "true"
+PROFILE_BASE = r"C:\tmp\wolt_profile" if os.name == "nt" else "/tmp/wolt_profile"
+# Ephemeral profile dir if you ever want to pass one in CI; we won't pass any by default on CI.
+PROFILE_DIR = PROFILE_BASE
+
 # Selenium
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -27,7 +35,11 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver import ActionChains
-from selenium.common.exceptions import TimeoutException, ElementClickInterceptedException, MoveTargetOutOfBoundsException
+from selenium.common.exceptions import (
+    TimeoutException,
+    ElementClickInterceptedException,
+    MoveTargetOutOfBoundsException,
+)
 from webdriver_manager.chrome import ChromeDriverManager
 
 # Gmail API
@@ -38,7 +50,7 @@ from googleapiclient.discovery import build
 # ==============================
 # CONFIG (edit these)
 # ==============================
-WOLT_EMAIL = "vilaferdinand1970@gmail.com"
+WOLT_EMAIL = os.environ.get("WOLT_EMAIL", "vilaferdinand1970@gmail.com")
 WOLT_LOGIN_URL = "https://merchant.wolt.com/login?next=/"
 
 TARGET_LISTING_MANAGER = (
@@ -47,8 +59,7 @@ TARGET_LISTING_MANAGER = (
 )
 
 # ----- REORDER SETTINGS -----
-# If DESIRED_ORDER is set, it will be used. Otherwise, MOVE_THIS_TO_TOP is used.
-MOVE_THIS_TO_TOP = "COMBOS"
+MOVE_THIS_TO_TOP = "COMBOS"  # used only if DESIRED_ORDER == []
 DESIRED_ORDER: List[str] = [
     "MENU DITORE",
     "COMBOS",
@@ -58,7 +69,6 @@ DESIRED_ORDER: List[str] = [
     "PANINE & WRAPS",
     "SHOQERUESE & EXTRA",
     "SUPA",
-    
     "SALLATA",
     "PASTA",
     "MISH & PESHKU",
@@ -122,9 +132,11 @@ def build_driver(headless: bool = False) -> webdriver.Chrome:
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
 
-    # persistent profile
-    opts.add_argument(r"--user-data-dir=C:\tmp\wolt_profile")
-    opts.add_argument("--profile-directory=Default")
+    # Use persistent profile only on local machine; on CI we skip to avoid locks
+    if not CI:
+        os.makedirs(PROFILE_DIR, exist_ok=True)
+        opts.add_argument(f"--user-data-dir={PROFILE_DIR}")
+        opts.add_argument("--profile-directory=Default")
 
     # hide automation
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
@@ -329,6 +341,7 @@ def find_latest_wolt_magic_link(svc, window_min: int) -> Optional[str]:
             print("[warn] failed to fetch message", m.get("id"), e)
             continue
 
+    # Extract links
         headers = {h["name"].lower(): h["value"] for h in full.get("payload", {}).get("headers", [])}
         print(f"[email] From: {headers.get('from')} | Subject: {headers.get('subject')}")
 
@@ -365,11 +378,9 @@ def _normalize(s: str) -> str:
     return s.casefold().strip()
 
 def _row_container_from_handle(handle_el):
-    # nearest ancestor row container
     return handle_el.find_element(By.XPATH, "ancestor::div[contains(@class,'sc-dPV')][1]")
 
 def _row_name_text(row):
-    # columns: [0]=handle, [1]=img, [2]=name, [3]=items, [4]=buttons...
     cols = row.find_elements(By.XPATH, "./div")
     if len(cols) >= 3:
         t = cols[2].text.strip()
@@ -399,7 +410,7 @@ def discover_rows(driver):
     WebDriverWait(driver, 15).until(EC.presence_of_element_located(DRAG_HANDLE))
     rows = _discover_handles_and_rows(driver)
 
-    # if virtualized, nudge to render more then refetch
+    # virtualized list: nudge
     if len(rows) < 10:
         driver.execute_script("window.scrollBy(0, 500);")
         time.sleep(0.25)
@@ -419,106 +430,72 @@ def print_order(rows):
 def _safe_drag_to_above(driver, src_handle, dst_row):
     """
     Drag the source HANDLE to just *above* the destination HANDLE.
-    Uses progressive higher offsets if the drop doesn't register.
+    Progressive offsets to ensure "insert above" is recognized.
     """
-    # Find destination handle (more reliable hot-drop zone than whole row)
     try:
         dst_handle = dst_row.find_element(By.CSS_SELECTOR, "div[aria-roledescription='draggable']")
     except Exception:
         dst_handle = dst_row  # fallback
 
-    # Make both elements visible and centered
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", dst_handle)
     time.sleep(0.2)
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", src_handle)
     time.sleep(0.2)
 
-    # Progressive upward offsets: try a little above row, then higher, then even higher
     upward_offsets = [-14, -24, -38]
-
-    body = driver.find_element(By.TAG_NAME, "body")
     for off in upward_offsets:
         try:
             actions = ActionChains(driver)
             actions.move_to_element(src_handle).pause(0.12)
             actions.click_and_hold(src_handle).pause(0.15)
-
-            # move to destination handle center
             actions.move_to_element(dst_handle).pause(0.1)
-
-            # tiny left nudge (toward the handle column) helps many UIs
-            actions.move_by_offset(-6, 0).pause(0.05)
-
-            # then go ABOVE the destination handle by 'off' pixels
+            actions.move_by_offset(-6, 0).pause(0.05)  # toward handle column
             actions.move_by_offset(0, off).pause(0.12)
-
-            # super short micro wiggle (helps DnD libs compute "above")
             actions.move_by_offset(0, -4).pause(0.06)
             actions.move_by_offset(0, +4).pause(0.06)
-
             actions.release().perform()
-            time.sleep(0.55)  # let UI settle
-
-            # return to caller; success will be validated by the caller
+            time.sleep(0.55)
             return
         except MoveTargetOutOfBoundsException:
-            # scroll a bit up and retry with next offset
             driver.execute_script("window.scrollBy(0, -120);")
             time.sleep(0.2)
         except Exception:
-            # try next offset
             time.sleep(0.2)
 
 def _bump_up_one(driver, index_now):
-    """
-    Move row at index_now up one slot above index_now-1.
-    Verifies success; retries with larger offset/scroll if needed.
-    """
+    """Move row at index_now up one position (above index_now-1) with verification."""
     assert index_now > 0, "Cannot bump index 0 up"
 
-    def N(s): 
-        return _normalize(s)
+    def N(s): return _normalize(s)
 
-    # Snapshot before
     rows_before = discover_rows(driver)
     name = rows_before[index_now]["name"]
     print(f"   ↥ bump '{name}' {index_now+1}→{index_now}")
 
-    # Try up to 3 times with growing aggressiveness
     for attempt in range(1, 4):
-        rows = discover_rows(driver)  # refresh DOM each attempt
-        # if already bumped (race), stop
+        rows = discover_rows(driver)
         current_names = [r["name"] for r in rows]
         curr_idx = [N(n) for n in current_names].index(N(name))
-
         if curr_idx <= index_now - 1:
             print(f"   ✓ already at {curr_idx+1}")
             return
 
         src = rows[curr_idx]
         dst = rows[curr_idx - 1]
-
         _safe_drag_to_above(driver, src["handle"], dst["row"])
 
-        # verify
         rows_after = discover_rows(driver)
         names_after = [r["name"] for r in rows_after]
         new_idx = [N(n) for n in names_after].index(N(name))
-
         if new_idx == curr_idx - 1:
-            # success
             return
 
-        # not moved: scroll slightly toward top and retry
         driver.execute_script("window.scrollBy(0, -120);")
         time.sleep(0.2)
 
     print(f"   ⚠️ could not bump '{name}' this step; continuing")
 
 def move_name_to_position(driver, name, target_index):
-    """
-    Bubble the named row up to target_index via adjacent swaps.
-    """
     def N(s): return _normalize(s)
     while True:
         rows = discover_rows(driver)
@@ -545,7 +522,7 @@ def verify_order(driver, desired_names, normalize=True):
         return s2.casefold().strip()
 
     desired_trim = [d for d in desired_names if any(N(d) == N(g) for g in got)]
-    diffs, missing = [], []
+    diffs = []
     for i, want in enumerate(desired_trim):
         if i >= len(got):
             break
@@ -555,10 +532,6 @@ def verify_order(driver, desired_names, normalize=True):
     return (len(diffs) == 0 and not missing), missing, diffs
 
 def reorder_to(driver, desired_names):
-    """
-    Adjacent-swap strategy: for i from top to bottom, bubble the desired row up
-    one slot at a time until it sits at index i.
-    """
     print("▶ Reordering to target list (adjacent swaps with verification) ...")
     def N(s): return _normalize(s)
 
@@ -583,7 +556,6 @@ def reorder_to(driver, desired_names):
             norms = [N(n) for n in names]
             idx_now = norms.index(N(want))
 
-    # Verify final order
     ok, missing, diffs = verify_order(driver, desired_names)
     if ok:
         print("✅ Order verified ✓")
@@ -612,7 +584,16 @@ def move_name_to_top(driver, name_to_top: str):
 # ==============================
 def main():
     print("=== Wolt automation with session health-check + Categories reorder (adjacent) ===")
-    driver = build_driver(headless=False)
+
+    # Write secrets from env (Render) into files if provided
+    if os.environ.get("GOOGLE_CREDENTIALS_JSON"):
+        with open("credentials.json", "w", encoding="utf-8") as f:
+            f.write(os.environ["GOOGLE_CREDENTIALS_JSON"])
+    if os.environ.get("GOOGLE_TOKEN_JSON"):
+        with open("token.json", "w", encoding="utf-8") as f:
+            f.write(os.environ["GOOGLE_TOKEN_JSON"])
+
+    driver = build_driver(headless=CI)
     try:
         if is_logged_in(driver):
             print("✅ Session active — skipping magic-link flow.")
@@ -659,7 +640,6 @@ def main():
 
         # ----- On Categories page -----
         time.sleep(1.0)
-        # Zoom out + larger window; start from top
         set_zoom_and_layout(driver, zoom_pct=75, width=1920, height=1200)
         driver.execute_script("window.scrollTo(0, 0);")
         time.sleep(0.4)
