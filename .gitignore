@@ -1,0 +1,14 @@
+# secrets and local state
+credentials.json
+token.json
+wolt_last_request.json
+
+# logs / debug
+wolt_debug/
+*.log
+
+# python junk
+__pycache__/
+*.pyc
+.venv/
+.env
